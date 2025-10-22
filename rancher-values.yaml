@@ -1,0 +1,24 @@
+# Valores para Rancher en entorno local con Minikube
+hostname: "192.168.49.2.nip.io"
+replicas: 1
+
+# Configuración para acceso local via Ingress
+service:
+  type: ClusterIP
+
+# Configuración de ingress habilitada
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  tls:
+    source: rancher
+
+# Bootstrap password para acceso inicial
+bootstrapPassword: "admin"
+
+# Configuración adicional para entorno local
+rancherImageTag: "v2.8.5"
+
+# Deshabilitar recursos que podrían causar problemas en Minikube
+useBundledSystemChart: true
+antiAffinity: preferred

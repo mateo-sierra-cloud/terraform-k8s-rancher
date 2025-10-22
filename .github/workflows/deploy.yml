@@ -1,0 +1,185 @@
+name: Deploy Terraform + Minikube + Rancher
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      cleanup_after_deploy:
+        description: 'Cleanup resources after deployment'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  KUBECONFIG: /tmp/kubeconfig
+
+jobs:
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+
+    - name: Terraform Init
+      run: terraform init
+
+    - name: Terraform Validate
+      run: terraform validate
+
+    - name: Terraform Plan
+      run: terraform plan -var-file=terraform.tfvars
+
+  deploy:
+    name: Deploy to Minikube
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Tools
+      run: |
+        # Install Terraform
+        wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt update && sudo apt install terraform
+
+        # Install kubectl
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+        # Install Helm
+        curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+        sudo apt-get update && sudo apt-get install helm
+
+        # Make scripts executable
+        chmod +x scripts/*.sh
+
+    - name: Setup Minikube
+      uses: medyagh/setup-minikube@master
+      with:
+        minikube-version: 1.37.0
+        kubernetes-version: v1.28.3
+        driver: docker
+        memory: 2048
+        cpus: 2
+
+    - name: Enable Addons
+      run: |
+        minikube addons enable ingress
+        minikube addons enable ingress-dns
+        
+        # Wait for ingress controller to be ready
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=300s
+
+    - name: Install cert-manager
+      run: |
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager \
+          --create-namespace \
+          --set installCRDs=true \
+          --wait --timeout=300s
+
+    - name: Deploy with Terraform
+      run: |
+        export KUBECONFIG=$HOME/.kube/config
+        kubectl config use-context minikube
+        
+        terraform init
+        terraform plan -var-file=terraform.tfvars
+        terraform apply -auto-approve -var-file=terraform.tfvars
+
+    - name: Verify Deployment
+      run: |
+        echo "Verificando el despliegue..."
+        
+        # Wait for Rancher to be ready
+        kubectl wait --for=condition=available deployment/rancher -n cattle-system --timeout=600s
+        
+        # Show cluster info
+        echo "Información del cluster:"
+        kubectl get nodes
+        kubectl get pods -n cattle-system
+        kubectl get svc -n cattle-system
+        kubectl get ingress -n cattle-system
+        
+        # Show Minikube info
+        echo "Información de Minikube:"
+        minikube ip
+        minikube status
+        
+        # Test Rancher accessibility
+        echo "Probando acceso a Rancher..."
+        kubectl port-forward -n cattle-system svc/rancher 8080:80 &
+        sleep 10
+        curl -f http://localhost:8080 || echo "Rancher no accesible via port-forward"
+
+    - name: Export Terraform Outputs
+      run: |
+        echo "Terraform Outputs:"
+        terraform output
+
+    - name: Cleanup (Optional)
+      if: ${{ github.event.inputs.cleanup_after_deploy == 'true' || github.event_name == 'pull_request' }}
+      run: |
+        echo "Limpiando recursos..."
+        terraform destroy -auto-approve -var-file=terraform.tfvars || true
+        minikube delete || true
+
+  test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Tools
+      run: |
+        # Install basic tools for testing
+        sudo apt update
+        sudo apt install -y curl jq
+
+    - name: Test Scripts Syntax
+      run: |
+        # Test shell scripts syntax
+        chmod +x scripts/*.sh
+        for script in scripts/*.sh; do
+          echo "Testing $script..."
+          bash -n "$script"
+        done
+
+    - name: Test Terraform Configuration
+      run: |
+        # Install Terraform
+        wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt update && sudo apt install terraform
+        
+        # Validate configuration
+        terraform init
+        terraform validate
+        terraform plan -var-file=terraform.tfvars
