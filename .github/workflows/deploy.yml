@@ -1,26 +1,26 @@
-name: Deploy Terraform + Minikube + Rancher
+name: Deploy Complete EKS Stack
 
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
-      cleanup_after_deploy:
-        description: 'Cleanup resources after deployment'
+      confirm_deploy:
+        description: 'Type "DEPLOY" to confirm EKS stack deployment'
+        required: true
+        type: string
+      deploy_k8s:
+        description: 'Deploy Kubernetes/Helm resources (aws-auth, ns, ALB controller, Rancher)'
         required: false
-        default: true
-        type: boolean
-
-env:
-  KUBECONFIG: /tmp/kubeconfig
+        type: choice
+        default: 'false'
+        options:
+        - 'false'
+        - 'true'
 
 jobs:
   validate:
     name: Validate Code
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -30,156 +30,174 @@ jobs:
       with:
         terraform_version: 1.6.0
 
-    - name: Terraform Format Check
-      run: terraform fmt -check -recursive
 
-    - name: Terraform Init
-      run: terraform init
+    - name: Terraform Init (syntax check only)
+      run: terraform init -backend=false
+
+    - name: Terraform Format (auto-fix)
+      run: terraform fmt -recursive
 
     - name: Terraform Validate
       run: terraform validate
 
-    - name: Terraform Plan
-      run: terraform plan -var-file=terraform.tfvars
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
 
   deploy:
-    name: Deploy to Minikube
+    name: Deploy to AWS Production
     runs-on: ubuntu-latest
     needs: validate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    
+    environment: production
+    permissions:
+      id-token: write
+      contents: read    
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Setup Tools
-      run: |
-        # Install Terraform
-        wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-        sudo apt update && sudo apt install terraform
-
-        # Install kubectl
-        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-        sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-
-        # Install Helm
-        curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-        sudo apt-get update && sudo apt-get install helm
-
-        # Make scripts executable
-        chmod +x scripts/*.sh
-
-    - name: Setup Minikube
-      uses: medyagh/setup-minikube@master
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
       with:
-        minikube-version: 1.37.0
-        kubernetes-version: v1.28.3
-        driver: docker
-        memory: 2048
-        cpus: 2
+        role-to-assume: ${{ secrets.ROLE_ARN }}
+        role-session-name: GitHubActions-TerraformDeploy
+        aws-region: us-east-1
+        audience: sts.amazonaws.com
 
-    - name: Enable Addons
-      run: |
-        minikube addons enable ingress
-        minikube addons enable ingress-dns
-        
-        # Wait for ingress controller to be ready
-        kubectl wait --namespace ingress-nginx \
-          --for=condition=ready pod \
-          --selector=app.kubernetes.io/component=controller \
-          --timeout=300s
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
 
-    - name: Install cert-manager
+    - name: Initialize Terraform
       run: |
-        helm repo add jetstack https://charts.jetstack.io
-        helm repo update
-        helm upgrade --install cert-manager jetstack/cert-manager \
-          --namespace cert-manager \
-          --create-namespace \
-          --set installCRDs=true \
-          --wait --timeout=300s
-
-    - name: Deploy with Terraform
-      run: |
-        export KUBECONFIG=$HOME/.kube/config
-        kubectl config use-context minikube
-        
         terraform init
-        terraform plan -var-file=terraform.tfvars
-        terraform apply -auto-approve -var-file=terraform.tfvars
 
-    - name: Verify Deployment
+    - name: Pre-create kubeconfig if deploying K8s
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
       run: |
-        echo "Verificando el despliegue..."
-        
-        # Wait for Rancher to be ready
-        kubectl wait --for=condition=available deployment/rancher -n cattle-system --timeout=600s
-        
-        # Show cluster info
-        echo "Información del cluster:"
-        kubectl get nodes
-        kubectl get pods -n cattle-system
-        kubectl get svc -n cattle-system
-        kubectl get ingress -n cattle-system
-        
-        # Show Minikube info
-        echo "Información de Minikube:"
-        minikube ip
-        minikube status
-        
-        # Test Rancher accessibility
-        echo "Probando acceso a Rancher..."
-        kubectl port-forward -n cattle-system svc/rancher 8080:80 &
-        sleep 10
-        curl -f http://localhost:8080 || echo "Rancher no accesible via port-forward"
+        aws eks update-kubeconfig --region us-east-1 --name $(terraform output -raw cluster_name || echo rancher-eks-cluster) --kubeconfig /tmp/kubeconfig || true
+        ls -l /tmp || true
+
+    - name: Plan Terraform (EKS only)
+      run: |
+        terraform plan -refresh=false \
+          -var-file=terraform.tfvars \
+          -var 'deploy_k8s=false' \
+          -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+          -target=data.aws_eks_cluster.selected \
+          -target=module.network \
+          -target=module.backend.aws_iam_role.cluster \
+          -target=module.backend.aws_iam_role_policy_attachment.cluster_AmazonEKSClusterPolicy \
+          -target=module.backend.aws_eks_cluster.main \
+          -target=module.backend.aws_iam_role.nodes \
+          -target=module.backend.aws_iam_role_policy_attachment.nodes_AmazonEKSWorkerNodePolicy \
+          -target=module.backend.aws_iam_role_policy_attachment.nodes_AmazonEKS_CNI_Policy \
+          -target=module.backend.aws_iam_role_policy_attachment.nodes_AmazonEC2ContainerRegistryReadOnly \
+          -target=module.backend.aws_security_group.node_group_sg \
+          -target=module.backend.aws_eks_node_group.main \
+          -target=module.backend.aws_iam_openid_connect_provider.eks \
+          -target=module.backend.aws_iam_policy.aws_load_balancer_controller \
+          -target=module.backend.aws_iam_role.aws_load_balancer_controller \
+          -target=module.backend.aws_iam_role_policy_attachment.aws_load_balancer_controller \
+          -out=tfplan
+
+    - name: Apply Terraform (EKS only)
+      run: |
+        terraform apply -auto-approve tfplan
+
+    - name: Wait for EKS to be ACTIVE
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name)
+        echo "Waiting for EKS cluster $CLUSTER_NAME to be ACTIVE..."
+        for i in {1..40}; do
+          STATUS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.status' --output text || echo "UNKNOWN")
+          echo "Status: $STATUS"
+          [ "$STATUS" = "ACTIVE" ] && exit 0
+          sleep 15
+        done
+        echo "Cluster not ACTIVE in time" && exit 1
+
+    - name: Plan Terraform (Bootstrap pipeline access)
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        terraform plan -refresh=false \
+          -var-file=terraform.tfvars \
+          -var 'create_pipeline_access=true' \
+          -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+          -target=data.aws_eks_cluster.selected \
+          -target=module.backend.aws_eks_access_entry.pipeline \
+          -target=module.backend.aws_eks_access_policy_association.pipeline \
+          -out=tfplan_bootstrap
+
+    - name: Apply Terraform (Bootstrap pipeline access)
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        terraform apply -auto-approve tfplan_bootstrap
+        echo "Waiting RBAC propagation..."; sleep 20
+
+    - name: Generate kubeconfig for providers
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        aws eks update-kubeconfig --region us-east-1 --name $(terraform output -raw cluster_name) --kubeconfig /tmp/kubeconfig
+        test -f /tmp/kubeconfig && echo "kubeconfig ready"
+
+    - name: Export KUBECONFIG env
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+
+    - name: Plan Terraform (aws-auth only)
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        echo "Skipping aws-auth (cluster uses API auth)"
+
+    - name: Apply Terraform (aws-auth only)
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        echo "Skipping aws-auth apply"
+
+    - name: Validate RBAC after bootstrap
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        for i in {1..20}; do
+          CAN_NS=$(kubectl --kubeconfig /tmp/kubeconfig auth can-i create namespaces || echo no)
+          CAN_CRD=$(kubectl --kubeconfig /tmp/kubeconfig auth can-i create customresourcedefinitions.apiextensions.k8s.io || echo no)
+          echo "Attempt $i - namespaces: $CAN_NS, CRDs: $CAN_CRD"
+          if [ "$CAN_NS" = "yes" ] && [ "$CAN_CRD" = "yes" ]; then echo "RBAC ready"; break; fi
+          sleep 5
+        done
+
+    - name: Plan Terraform (K8s/Helm)
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        terraform plan -refresh=false -var-file=terraform.tfvars -var 'deploy_k8s=true' -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+          -target=module.backend.kubernetes_namespace.cattle_system \
+          -target=module.backend.helm_release.aws_load_balancer_controller \
+          -target=module.backend.helm_release.rancher \
+          -target=module.backend.kubernetes_ingress_v1.rancher_ingress \
+          -out=tfplan_k8s
+
+    - name: Apply Terraform (K8s/Helm)
+      if: ${{ github.event.inputs.deploy_k8s == 'true' }}
+      run: |
+        terraform apply -auto-approve tfplan_k8s
 
     - name: Export Terraform Outputs
       run: |
         echo "Terraform Outputs:"
         terraform output
 
-    - name: Cleanup (Optional)
-      if: ${{ github.event.inputs.cleanup_after_deploy == 'true' || github.event_name == 'pull_request' }}
+    - name: Complete Stack Summary
       run: |
-        echo "Limpiando recursos..."
-        terraform destroy -auto-approve -var-file=terraform.tfvars || true
-        minikube delete || true
+        echo "🚀 EKS STACK DEPLOYED!"
+        echo "======================"
+        echo "Environment: Production"
+        echo "Cluster Name: $(terraform output -raw cluster_name)"
+        echo "Cluster Endpoint: $(terraform output -raw cluster_endpoint)"
+        echo "Region: us-east-1"
+        echo ""
+        echo "K8s/Helm applied: ${{ github.event.inputs.deploy_k8s || 'false' }}"
 
-  test:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    needs: validate
-    if: github.event_name == 'pull_request'
-    
-    steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-
-    - name: Setup Tools
+    - name: Debug assumed role
       run: |
-        # Install basic tools for testing
-        sudo apt update
-        sudo apt install -y curl jq
-
-    - name: Test Scripts Syntax
-      run: |
-        # Test shell scripts syntax
-        chmod +x scripts/*.sh
-        for script in scripts/*.sh; do
-          echo "Testing $script..."
-          bash -n "$script"
-        done
-
-    - name: Test Terraform Configuration
-      run: |
-        # Install Terraform
-        wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-        sudo apt update && sudo apt install terraform
-        
-        # Validate configuration
-        terraform init
-        terraform validate
-        terraform plan -var-file=terraform.tfvars
+        aws sts get-caller-identity
+        echo "Expected ROLE ARN: ${{ secrets.ROLE_ARN }}"

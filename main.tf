@@ -1,43 +1,34 @@
-# module "network" {
-#   source = "./modules/network"
-#   name   = var.cluster_name
-#   cidr   = var.vpc_cidr
+# Main Terraform configura  tags              = var.tagsn - Root Module
+# This file orchestrates all the modules in the correct order
 
-#   public_subnets  = var.public_subnets
-#   private_subnets = var.private_subnets
-#   tags = var.tags
-# }
+# Network Module - AWS Infrastructure
+module "network" {
+  source = "./modules/network"
 
-# module "backend" {
-#   source = "./modules/backend"
+  vpc_cidr        = var.vpc_cidr
+  public_subnets  = var.public_subnets
+  private_subnets = var.private_subnets
+  cluster_name    = var.cluster_name
+  tags            = var.tags
+}
 
-#   cluster_name    = var.cluster_name
-#   cluster_version = var.cluster_version
-#   vpc_id          = module.network.vpc_id
-#   subnet_ids      = concat(module.network.public_subnet_ids, module.network.private_subnet_ids)
-#   node_groups     = var.node_groups
-#   tags            = var.tags
+# Backend Module - EKS and Kubernetes
+module "backend" {
+  source = "./modules/backend"
 
-#   rancher_name       = "rancher"
-#   rancher_repository = "https://releases.rancher.com/server-charts/stable"
-#   rancher_chart      = "rancher"
-#   rancher_version    = var.rancher_version
-#   rancher_namespace  = "cattle-system"
-#   values_file        = "${path.root}/rancher-values.yaml"
-# }
+  cluster_name       = var.cluster_name
+  cluster_version    = var.cluster_version
+  vpc_id             = module.network.vpc_id
+  vpc_cidr_block     = module.network.vpc_cidr_block
+  public_subnet_ids  = module.network.public_subnet_ids
+  private_subnet_ids = module.network.private_subnet_ids
+  node_groups        = var.node_groups
+  rancher_version    = var.rancher_version
+  tags               = var.tags
+  eks_access_entries = var.eks_access_entries
+  deploy_k8s         = var.deploy_k8s
+  pipeline_deployer_role_arn = var.pipeline_deployer_role_arn
+  create_pipeline_access     = var.create_pipeline_access
 
-module "kubernetes" {
-  source = "./modules/kubernetes"
-
-  cpus                = 2
-  memory              = 2048
-  kubernetes_version  = "v1.28.3"
-
-  rancher_name        = "rancher"
-  rancher_repository  = "https://releases.rancher.com/server-charts/stable"
-  rancher_chart       = "rancher"
-  rancher_version     = "2.8.5"
-  rancher_namespace   = "cattle-system"
-  rancher_hostname    = "192.168.49.2.nip.io"
-  values_file         = "${path.root}/rancher-values.yaml"
+  depends_on = [module.network]
 }

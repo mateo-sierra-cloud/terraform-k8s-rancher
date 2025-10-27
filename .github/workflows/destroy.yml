@@ -1,0 +1,177 @@
+name: Destroy AWS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type "DESTROY" to confirm infrastructure destruction'
+        required: true
+        type: string
+      force_destroy:
+        description: 'Force destroy even if there are errors'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  validate-destroy:
+    name: Validate Destruction Request
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Validate Confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirmation }}" != "DESTROY" ]; then
+          echo "❌ Destruction not confirmed. You must type 'DESTROY' exactly."
+          echo "You typed: '${{ github.event.inputs.confirmation }}'"
+          exit 1
+        fi
+        echo "✅ Destruction confirmed for production environment"
+
+    - name: Check Branch
+      run: |
+        if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+          echo "❌ Destruction can only be run from main branch"
+          echo "Current branch: ${{ github.ref }}"
+          exit 1
+        fi
+        echo "✅ Running from main branch"
+
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    needs: validate-destroy
+    environment: production-destroy
+    permissions:
+      id-token: write   # Required for OIDC
+      contents: read    # Required to checkout code
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.ROLE_ARN }}
+        role-session-name: GitHubActions-DestroyInfra
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'v3.13.0'
+
+    - name: Initialize Terraform
+      run: |
+        terraform init
+
+    - name: Show Current Infrastructure
+      run: |
+        echo "📊 Current infrastructure state:"
+        terraform show || echo "No state found"
+        
+        echo ""
+        echo "📋 Resources that will be destroyed:"
+        terraform plan -destroy -var-file=terraform.tfvars || echo "Plan failed - continuing with destroy"
+
+    - name: Pre-Destroy Cleanup
+      run: |
+        echo "🧹 Cleaning up Kubernetes resources..."
+        
+        # Try to get cluster info
+        CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "rancher-eks-cluster")
+        
+        # Configure kubectl if cluster exists
+        if aws eks describe-cluster --name $CLUSTER_NAME --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "Configuring kubectl for cluster: $CLUSTER_NAME"
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME
+          
+          # Delete Rancher Helm release
+          echo "Removing Rancher Helm release..."
+          helm uninstall rancher -n cattle-system --timeout=300s || echo "Rancher already removed"
+          
+          # Delete AWS Load Balancer Controller
+          echo "Removing AWS Load Balancer Controller..."
+          helm uninstall aws-load-balancer-controller -n kube-system --timeout=300s || echo "ALB Controller already removed"
+          
+          # Delete cert-manager
+          echo "Removing cert-manager..."
+          helm uninstall cert-manager -n cert-manager --timeout=300s || echo "cert-manager already removed"
+          
+          # Wait for resources to clean up
+          echo "Waiting for resources to clean up..."
+          sleep 60
+          
+          # Show remaining resources
+          echo "Remaining pods:"
+          kubectl get pods --all-namespaces || echo "Cannot get pods"
+          
+          echo "Remaining load balancers:"
+          kubectl get svc --all-namespaces -o wide | grep LoadBalancer || echo "No LoadBalancer services found"
+          
+        else
+          echo "Cluster $CLUSTER_NAME not found or not accessible"
+        fi
+
+    - name: Destroy Infrastructure
+      run: |
+        echo "🔥 Starting infrastructure destruction..."
+        
+        if [ "${{ github.event.inputs.force_destroy }}" = "true" ]; then
+          echo "⚠️ Force destroy enabled - ignoring errors"
+          terraform destroy -auto-approve -var-file=terraform.tfvars || echo "Destroy completed with errors (force mode)"
+        else
+          terraform destroy -auto-approve -var-file=terraform.tfvars
+        fi
+
+    - name: Verify Destruction
+      run: |
+        echo "🔍 Verifying infrastructure destruction..."
+        
+        # Check if any resources remain in state
+        echo "Terraform state after destruction:"
+        terraform show || echo "✅ No state found - destruction complete"
+        
+        # Check AWS resources manually
+        echo ""
+        echo "Checking for remaining AWS resources..."
+        
+        # Check EKS clusters
+        echo "EKS Clusters:"
+        aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[?contains(@, `rancher`)]' || echo "No EKS clusters found"
+        
+        # Check VPCs
+        echo "VPCs with rancher tag:"
+        aws ec2 describe-vpcs --region ${{ env.AWS_REGION }} --filters "Name=tag:Name,Values=*rancher*" --query 'Vpcs[].{Name:Tags[?Key==`Name`].Value|[0],VpcId:VpcId,State:State}' --output table || echo "No VPCs found"
+        
+        # Check Load Balancers
+        echo "Application Load Balancers:"
+        aws elbv2 describe-load-balancers --region ${{ env.AWS_REGION }} --query 'LoadBalancers[?contains(LoadBalancerName, `k8s`)].[LoadBalancerName,State.Code]' --output table || echo "No ALBs found"
+
+    - name: Post-Destroy Summary
+      run: |
+        echo "📊 DESTRUCTION SUMMARY"
+        echo "===================="
+        echo "Environment: production"
+        echo "Executed by: ${{ github.actor }}"
+        echo "Timestamp: $(date)"
+        echo "Force mode: ${{ github.event.inputs.force_destroy }}"
+        echo ""
+        echo "✅ Infrastructure destruction completed"
+        echo ""
+        echo "⚠️ IMPORTANT: Check AWS Console to verify all resources are deleted"
+        echo "⚠️ Some resources like S3 buckets may need manual cleanup"
