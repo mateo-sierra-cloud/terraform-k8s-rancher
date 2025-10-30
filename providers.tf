@@ -27,25 +27,26 @@ provider "aws" {
 
 # Fallback: lee el cluster existente por nombre si los outputs del módulo aún no están disponibles
 data "aws_eks_cluster" "selected" {
-  name = var.cluster_name
+  count = var.deploy_k8s ? 1 : 0
+  name  = var.cluster_name
 }
 
 # Providers de Kubernetes y Helm usando outputs del módulo backend o, si no están, el data source
 locals {
   kube_host = coalesce(
     try(module.backend.cluster_endpoint, null),
-    try(data.aws_eks_cluster.selected.endpoint, null)
+    try(data.aws_eks_cluster.selected[0].endpoint, null)
   )
   kube_ca = coalesce(
     try(base64decode(module.backend.cluster_certificate_authority), null),
-    try(base64decode(data.aws_eks_cluster.selected.certificate_authority[0].data), null)
+    try(base64decode(data.aws_eks_cluster.selected[0].certificate_authority[0].data), null)
   )
 }
 
 provider "kubernetes" {
-  host                   = local.kube_host
-  cluster_ca_certificate = local.kube_ca
-  config_path            = fileexists(var.kubeconfig_path) ? var.kubeconfig_path : null
+  host                   = var.deploy_k8s && length(data.aws_eks_cluster.selected) > 0 ? data.aws_eks_cluster.selected[0].endpoint : ""
+  cluster_ca_certificate = var.deploy_k8s && length(data.aws_eks_cluster.selected) > 0 ? base64decode(data.aws_eks_cluster.selected[0].certificate_authority[0].data) : ""
+  config_path            = var.kubeconfig_path
 
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
@@ -56,9 +57,9 @@ provider "kubernetes" {
 
 provider "helm" {
   kubernetes {
-    host                   = local.kube_host
-    cluster_ca_certificate = local.kube_ca
-    config_path            = fileexists(var.kubeconfig_path) ? var.kubeconfig_path : null
+    host                   = var.deploy_k8s && length(data.aws_eks_cluster.selected) > 0 ? data.aws_eks_cluster.selected[0].endpoint : ""
+    cluster_ca_certificate = var.deploy_k8s && length(data.aws_eks_cluster.selected) > 0 ? base64decode(data.aws_eks_cluster.selected[0].certificate_authority[0].data) : ""
+    config_path            = var.kubeconfig_path
 
     exec {
       api_version = "client.authentication.k8s.io/v1beta1"

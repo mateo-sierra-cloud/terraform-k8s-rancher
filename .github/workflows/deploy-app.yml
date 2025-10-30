@@ -1,0 +1,199 @@
+name: Deploy APPs on EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deploy:
+        description: 'Type "DEPLOY" to confirm  deployment'
+        required: true
+        type: string
+
+jobs:
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Init (syntax check only)
+      run: terraform init -backend=false
+
+    - name: Terraform Validate
+      run: terraform validate
+
+  deploy-rancher:
+    name: Deploy Rancher to EKS
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: production
+    permissions:
+      id-token: write
+      contents: read    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.ROLE_ARN }}
+        role-session-name: GitHubActions-RancherDeploy
+        aws-region: us-east-1
+        audience: sts.amazonaws.com
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Initialize Terraform
+      run: terraform init
+
+    - name: Verify EKS Cluster Exists
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name || echo "rancher-eks-cluster")
+        if ! aws eks describe-cluster --name "$CLUSTER_NAME" --region us-east-1 > /dev/null 2>&1; then
+          echo "❌ EKS cluster not found. Run 'Deploy EKS Cluster' workflow first."
+          exit 1
+        fi
+        echo "✅ EKS cluster found: $CLUSTER_NAME"
+
+    - name: Generate kubeconfig
+      run: |
+        aws eks update-kubeconfig --region us-east-1 --name $(terraform output -raw cluster_name) --kubeconfig /tmp/kubeconfig
+        test -f /tmp/kubeconfig && echo "kubeconfig ready"
+
+    - name: Export KUBECONFIG env
+      run: echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+
+    - name: Verify Access Entry exists
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name)
+        PRINCIPAL_ARN=${{ secrets.ROLE_ARN }}
+        echo "Checking Access Entry for $PRINCIPAL_ARN on $CLUSTER_NAME"
+        aws eks describe-access-entry --cluster-name "$CLUSTER_NAME" --principal-arn "$PRINCIPAL_ARN" || {
+          echo "❌ Access Entry not found. Re-running deploy-infra workflow is required."
+          exit 1
+        }
+        echo "✅ Access Entry found"
+        echo "Associated policies:"
+        aws eks list-associated-access-policies --cluster-name "$CLUSTER_NAME" --principal-arn "$PRINCIPAL_ARN"
+
+    - name: Verify cluster authentication mode
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name)
+        AUTH_MODE=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.accessConfig.authenticationMode' --output text)
+        echo "Current authentication mode: $AUTH_MODE"
+        
+        if [ "$AUTH_MODE" = "API" ]; then
+          echo "⚠️ Cluster is in API mode. Updating to API_AND_CONFIG_MAP..."
+          aws eks update-cluster-config --name "$CLUSTER_NAME" --region us-east-1 \
+            --access-config authenticationMode=API_AND_CONFIG_MAP
+          
+          echo "Waiting for cluster update to complete..."
+          for i in {1..60}; do
+            STATUS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.status' --output text)
+            echo "Cluster status: $STATUS"
+            if [ "$STATUS" = "ACTIVE" ]; then
+              sleep 10
+              break
+            fi
+            sleep 10
+          done
+          
+          AUTH_MODE=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.accessConfig.authenticationMode' --output text)
+          echo "Updated authentication mode: $AUTH_MODE"
+          
+          echo "Regenerating kubeconfig after auth mode change..."
+          rm -f /tmp/kubeconfig
+          aws eks update-kubeconfig --region us-east-1 --name "$CLUSTER_NAME" --kubeconfig /tmp/kubeconfig
+          echo "✅ kubeconfig regenerated"
+        else
+          echo "✅ Cluster already in API_AND_CONFIG_MAP mode"
+        fi
+
+    - name: Patch aws-auth ConfigMap (fallback for API mode)
+      run: |
+        echo "Checking if aws-auth ConfigMap exists..."
+        if ! kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system 2>/dev/null; then
+          echo "❌ aws-auth ConfigMap not found. Run deploy-infra first."
+          exit 1
+        fi
+        
+        echo "Verifying pipeline role is in aws-auth..."
+        kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system -o yaml | tee /tmp/aws-auth-current.yaml
+        
+        if ! grep -q "${{ secrets.ROLE_ARN }}" /tmp/aws-auth-current.yaml; then
+          echo "❌ Pipeline role not found in aws-auth. This should have been created by deploy-infra."
+          echo "Please re-run deploy-infra workflow."
+          exit 1
+        fi
+        
+        echo "✅ Pipeline role found in aws-auth ConfigMap"
+        sleep 5
+
+    - name: Validate RBAC permissions
+      run: |
+        echo "Validating RBAC for pipeline role..."
+        for i in {1..20}; do
+          CAN_NS=$(kubectl --kubeconfig /tmp/kubeconfig auth can-i create namespaces || echo no)
+          CAN_CRD=$(kubectl --kubeconfig /tmp/kubeconfig auth can-i create customresourcedefinitions.apiextensions.k8s.io || echo no)
+          echo "Attempt $i - namespaces: $CAN_NS, CRDs: $CAN_CRD"
+          if [ "$CAN_NS" = "yes" ] && [ "$CAN_CRD" = "yes" ]; then
+            echo "✅ RBAC ready"; break
+          fi
+          sleep 5
+        done
+
+    - name: Plan Terraform (K8s/Helm)
+      run: |
+        terraform plan -refresh=false -compact-warnings \
+          -var-file=terraform.tfvars \
+          -var 'deploy_k8s=true' \
+          -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+          -target=module.backend.kubernetes_namespace.cattle_system \
+          -target=module.backend.helm_release.aws_load_balancer_controller \
+          -target=module.backend.helm_release.rancher \
+          -target=module.backend.kubernetes_ingress_v1.rancher_ingress \
+          -out=tfplan_k8s || true
+
+    - name: Apply Terraform (K8s/Helm)
+      run: terraform apply -auto-approve tfplan_k8s
+
+    - name: Wait for Rancher to be Ready
+      run: |
+        echo "Waiting for Rancher deployment..."
+        for i in {1..30}; do
+          READY=$(kubectl --kubeconfig /tmp/kubeconfig get deploy rancher -n cattle-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+          echo "Attempt $i - Ready replicas: $READY"
+          if [ "$READY" -gt 0 ]; then
+            echo "✅ Rancher is ready"; break
+          fi
+          sleep 10
+        done
+
+    - name: Export Terraform Outputs
+      run: |
+        echo "Terraform Outputs:"
+        terraform output
+
+    - name: Rancher Deployment Summary
+      run: |
+        echo "🚀 RANCHER DEPLOYED!"
+        echo "======================"
+        echo "Cluster Name: $(terraform output -raw cluster_name)"
+        echo "Rancher Namespace: $(terraform output -raw rancher_namespace)"
+        echo "Rancher Hostname: $(terraform output -raw rancher_hostname)"
+        echo ""
+        echo "🌐 Access Rancher via Load Balancer:"
+        LB_DNS=$(kubectl --kubeconfig /tmp/kubeconfig get ingress rancher-alb -n cattle-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+        echo "Load Balancer DNS: $LB_DNS"
+        echo ""
+        echo "Default password: admin"

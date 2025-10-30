@@ -98,7 +98,8 @@ jobs:
         # Configure kubectl if cluster exists
         if aws eks describe-cluster --name $CLUSTER_NAME --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
           echo "Configuring kubectl for cluster: $CLUSTER_NAME"
-          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME --kubeconfig /tmp/kubeconfig
+          export KUBECONFIG=/tmp/kubeconfig
           
           # Delete Rancher Helm release
           echo "Removing Rancher Helm release..."
@@ -125,6 +126,13 @@ jobs:
           
         else
           echo "Cluster $CLUSTER_NAME not found or not accessible"
+          echo "Creating empty kubeconfig to avoid provider errors..."
+          mkdir -p /tmp
+          echo "apiVersion: v1" > /tmp/kubeconfig
+          echo "kind: Config" >> /tmp/kubeconfig
+          echo "clusters: []" >> /tmp/kubeconfig
+          echo "contexts: []" >> /tmp/kubeconfig
+          echo "users: []" >> /tmp/kubeconfig
         fi
 
     - name: Destroy Infrastructure

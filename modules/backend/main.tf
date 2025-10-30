@@ -43,7 +43,7 @@ resource "aws_eks_cluster" "main" {
   enabled_cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
 
   access_config {
-    authentication_mode = "API"
+    authentication_mode = "API_AND_CONFIG_MAP"
   }
 
   lifecycle {
@@ -274,10 +274,6 @@ resource "aws_eks_access_entry" "pipeline" {
   principal_arn = local.pipeline_role_arn
   type          = "STANDARD"
   depends_on    = [aws_eks_cluster.main]
-
-  lifecycle {
-    prevent_destroy = true
-  }
 }
 
 resource "aws_eks_access_policy_association" "pipeline" {
@@ -287,16 +283,11 @@ resource "aws_eks_access_policy_association" "pipeline" {
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
   access_scope { type = "cluster" }
   depends_on = [aws_eks_access_entry.pipeline]
-
-  lifecycle {
-    prevent_destroy = true
-  }
 }
 
-# ConfigMap aws-auth deshabilitado: usamos Access Entries (API auth)
-resource "kubernetes_config_map_v1_data" "aws_auth" {
-  count = 0
-  force = true
+# ConfigMap aws-auth para compatibilidad con roles externos
+resource "kubernetes_config_map_v1" "aws_auth" {
+  count = var.deploy_k8s || var.create_pipeline_access ? 1 : 0
 
   metadata {
     name      = "aws-auth"
@@ -341,7 +332,6 @@ resource "kubernetes_namespace" "cattle_system" {
   depends_on = [
     aws_eks_cluster.main,
     aws_eks_node_group.main,
-    kubernetes_config_map_v1_data.aws_auth,
     aws_eks_access_entry.pipeline,
     aws_eks_access_policy_association.pipeline
   ]
@@ -388,7 +378,6 @@ resource "kubernetes_ingress_v1" "rancher_ingress" {
   depends_on = [
     helm_release.aws_load_balancer_controller,
     helm_release.rancher,
-    kubernetes_config_map_v1_data.aws_auth,
     aws_eks_access_entry.pipeline,
     aws_eks_access_policy_association.pipeline
   ]
@@ -429,7 +418,6 @@ EOF
     aws_eks_node_group.main,
     aws_iam_role.aws_load_balancer_controller,
     aws_iam_role_policy_attachment.aws_load_balancer_controller,
-    kubernetes_config_map_v1_data.aws_auth,
     aws_eks_access_entry.pipeline,
     aws_eks_access_policy_association.pipeline
   ]
@@ -488,7 +476,6 @@ EOF
 
   depends_on = [
     kubernetes_namespace.cattle_system,
-    kubernetes_config_map_v1_data.aws_auth,
     aws_eks_access_entry.pipeline,
     aws_eks_access_policy_association.pipeline
   ]

@@ -1,0 +1,142 @@
+name: Deploy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deploy:
+        description: 'Type "DEPLOY" to confirm EKS cluster deployment'
+        required: true
+        type: string
+
+jobs:
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Init (syntax check only)
+      run: terraform init -backend=false
+
+    - name: Terraform Format (auto-fix)
+      run: terraform fmt -recursive
+
+    - name: Terraform Validate
+      run: terraform validate
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+
+  deploy-eks:
+    name: Deploy EKS to AWS Production
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: production
+    permissions:
+      id-token: write
+      contents: read    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.ROLE_ARN }}
+        role-session-name: GitHubActions-EKSDeploy
+        aws-region: us-east-1
+        audience: sts.amazonaws.com
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Initialize Terraform
+      run: terraform init
+
+    - name: Plan Terraform (Complete Infrastructure)
+      run: |
+        terraform plan -compact-warnings \
+          -var-file=terraform.tfvars \
+          -var 'deploy_k8s=false' \
+          -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+          -out=tfplan || true
+
+    - name: Apply Terraform (Complete Infrastructure)
+      run: terraform apply -auto-approve tfplan
+
+    - name: Wait for EKS to be ACTIVE
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name)
+        echo "Waiting for EKS cluster $CLUSTER_NAME to be ACTIVE..."
+        for i in {1..40}; do
+          STATUS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query 'cluster.status' --output text || echo "UNKNOWN")
+          echo "Status: $STATUS"
+          [ "$STATUS" = "ACTIVE" ] && exit 0
+          sleep 15
+        done
+        echo "Cluster not ACTIVE in time" && exit 1
+
+    - name: Generate kubeconfig for aws-auth
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name)
+        aws eks update-kubeconfig --region us-east-1 --name "$CLUSTER_NAME" --kubeconfig /tmp/kubeconfig
+        echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+
+    - name: Apply aws-auth ConfigMap via Terraform
+      run: |
+        # Check if aws-auth already exists in Terraform state
+        if terraform state show module.backend.kubernetes_config_map_v1.aws_auth[0] 2>/dev/null; then
+          echo "✅ aws-auth already in Terraform state, skipping creation"
+        else
+          # Check if aws-auth exists in cluster
+          if kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system 2>/dev/null; then
+            echo "⚠️ aws-auth exists in cluster but not in Terraform state. Importing..."
+            terraform import \
+              -var-file=terraform.tfvars \
+              -var 'deploy_k8s=false' \
+              -var 'create_pipeline_access=true' \
+              -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+              'module.backend.kubernetes_config_map_v1.aws_auth[0]' \
+              'kube-system/aws-auth'
+          else
+            # Create aws-auth if it doesn't exist
+            terraform apply -auto-approve \
+              -var-file=terraform.tfvars \
+              -var 'deploy_k8s=false' \
+              -var 'create_pipeline_access=true' \
+              -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+              -target=module.backend.kubernetes_config_map_v1.aws_auth
+          fi
+        fi
+        echo "✅ aws-auth ConfigMap ready"
+        sleep 10
+
+    - name: Export Terraform Outputs
+      run: |
+        echo "Terraform Outputs:"
+        terraform output
+
+    - name: EKS Cluster Summary
+      run: |
+        echo "🚀 EKS CLUSTER DEPLOYED!"
+        echo "======================"
+        echo "Environment: Production"
+        echo "Cluster Name: $(terraform output -raw cluster_name)"
+        echo "Cluster Endpoint: $(terraform output -raw cluster_endpoint)"
+        echo "Region: us-east-1"
+        echo ""
+        echo "✅ Next step: Run 'Deploy Rancher' workflow to install Rancher"
+
+    - name: Debug assumed role
+      run: |
+        aws sts get-caller-identity
+        echo "Expected ROLE ARN: ${{ secrets.ROLE_ARN }}"
