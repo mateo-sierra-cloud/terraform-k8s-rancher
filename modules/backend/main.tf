@@ -106,7 +106,7 @@ resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = each.value.name
   node_role_arn   = aws_iam_role.nodes.arn
-  subnet_ids      = var.private_subnet_ids
+  subnet_ids      = var.public_subnet_ids  # Changed to public subnets
 
   capacity_type  = "ON_DEMAND"
   ami_type       = "AL2_x86_64"
@@ -138,10 +138,11 @@ resource "aws_security_group" "node_group_sg" {
   vpc_id      = var.vpc_id
 
   ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr_block]
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all traffic (POC only)"
   }
 
   egress {
@@ -161,11 +162,12 @@ resource "aws_iam_role" "aws_load_balancer_controller" {
   name = "${var.cluster_name}-aws-load-balancer-controller"
 
   assume_role_policy = jsonencode({
+    Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
+      Action = "sts:AssumeRoleWithWebIdentity"
       Effect = "Allow"
       Principal = {
-        Federated = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}"
+        Federated = aws_iam_openid_connect_provider.eks.arn
       }
       Condition = {
         StringEquals = {
@@ -174,7 +176,6 @@ resource "aws_iam_role" "aws_load_balancer_controller" {
         }
       }
     }]
-    Version = "2012-10-17"
   })
 
   tags = var.tags
@@ -245,14 +246,15 @@ resource "aws_iam_policy" "aws_load_balancer_controller" {
         Effect = "Allow"
         Action = [
           "ec2:CreateSecurityGroup",
-          "ec2:CreateTags"
+          "ec2:CreateTags",
+          "ec2:DeleteTags",
+          "ec2:AuthorizeSecurityGroupIngress",
+          "ec2:RevokeSecurityGroupIngress",
+          "ec2:AuthorizeSecurityGroupEgress",
+          "ec2:RevokeSecurityGroupEgress",
+          "ec2:DeleteSecurityGroup"
         ]
-        Resource = "arn:aws:ec2:*:*:security-group/*"
-        Condition = {
-          StringEquals = {
-            "ec2:CreateAction" = "CreateSecurityGroup"
-          }
-        }
+        Resource = "*"
       }
     ]
   })
@@ -263,31 +265,15 @@ resource "aws_iam_role_policy_attachment" "aws_load_balancer_controller" {
   role       = aws_iam_role.aws_load_balancer_controller.name
 }
 
-# Access Entry para el rol del pipeline (si se provee)
+# Access Entry DISABLED - Using only aws-auth ConfigMap to avoid {{SessionName}} placeholder issues
+# The pipeline role will be added directly to aws-auth ConfigMap below
 locals {
   pipeline_role_arn = trimspace(var.pipeline_deployer_role_arn) != "" ? var.pipeline_deployer_role_arn : null
 }
 
-resource "aws_eks_access_entry" "pipeline" {
-  count         = local.pipeline_role_arn != null ? 1 : 0
-  cluster_name  = aws_eks_cluster.main.name
-  principal_arn = local.pipeline_role_arn
-  type          = "STANDARD"
-  depends_on    = [aws_eks_cluster.main]
-}
-
-resource "aws_eks_access_policy_association" "pipeline" {
-  count         = local.pipeline_role_arn != null ? 1 : 0
-  cluster_name  = aws_eks_cluster.main.name
-  principal_arn = local.pipeline_role_arn
-  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
-  access_scope { type = "cluster" }
-  depends_on = [aws_eks_access_entry.pipeline]
-}
-
 # ConfigMap aws-auth para compatibilidad con roles externos
 resource "kubernetes_config_map_v1" "aws_auth" {
-  count = var.deploy_k8s || var.create_pipeline_access ? 1 : 0
+  count = var.deploy_k8s ? 1 : 0
 
   metadata {
     name      = "aws-auth"
@@ -331,10 +317,27 @@ resource "kubernetes_namespace" "cattle_system" {
   timeouts { delete = "15m" }
   depends_on = [
     aws_eks_cluster.main,
-    aws_eks_node_group.main,
-    aws_eks_access_entry.pipeline,
-    aws_eks_access_policy_association.pipeline
+    aws_eks_node_group.main
   ]
+}
+
+# ClusterRoleBinding for Rancher ServiceAccount
+resource "kubernetes_cluster_role_binding" "rancher_admin" {
+  count = var.deploy_k8s ? 1 : 0
+  metadata {
+    name = "rancher-admin"
+  }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = "cluster-admin"
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = "rancher"
+    namespace = "cattle-system"
+  }
+  depends_on = [kubernetes_namespace.cattle_system]
 }
 
 # Ingress for Rancher with ALB
@@ -377,9 +380,7 @@ resource "kubernetes_ingress_v1" "rancher_ingress" {
 
   depends_on = [
     helm_release.aws_load_balancer_controller,
-    helm_release.rancher,
-    aws_eks_access_entry.pipeline,
-    aws_eks_access_policy_association.pipeline
+    helm_release.rancher
   ]
 }
 
@@ -417,9 +418,7 @@ EOF
   depends_on = [
     aws_eks_node_group.main,
     aws_iam_role.aws_load_balancer_controller,
-    aws_iam_role_policy_attachment.aws_load_balancer_controller,
-    aws_eks_access_entry.pipeline,
-    aws_eks_access_policy_association.pipeline
+    aws_iam_role_policy_attachment.aws_load_balancer_controller
   ]
 }
 
@@ -442,41 +441,44 @@ bootstrapPassword: admin
 ingress:
   enabled: false
 service:
-  type: ClusterIP
+  type: NodePort
   ports:
   - port: 80
     targetPort: 80
     protocol: TCP
     name: http
+    nodePort: 30080
 resources:
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: 2000m
+    memory: 2Gi
   requests:
-    cpu: 250m
-    memory: 256Mi
+    cpu: 500m
+    memory: 1Gi
 replicas: 1
 useBundledSystemChart: true
 antiAffinity: preferred
 topologySpreadConstraints: []
 livenessProbe:
   httpGet:
-    path: /ping
+    path: /healthz
     port: 80
   initialDelaySeconds: 60
   periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 6
 readinessProbe:
   httpGet:
-    path: /ping
+    path: /healthz
     port: 80
-  initialDelaySeconds: 5
-  periodSeconds: 30
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
 EOF
   ]
 
   depends_on = [
-    kubernetes_namespace.cattle_system,
-    aws_eks_access_entry.pipeline,
-    aws_eks_access_policy_association.pipeline
+    kubernetes_namespace.cattle_system
   ]
 }

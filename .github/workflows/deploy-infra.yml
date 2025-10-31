@@ -62,15 +62,30 @@ jobs:
     - name: Initialize Terraform
       run: terraform init
 
-    - name: Plan Terraform (Complete Infrastructure)
+    - name: Generate kubeconfig
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "rancher-eks-cluster")
+        if aws eks describe-cluster --name "$CLUSTER_NAME" --region us-east-1 > /dev/null 2>&1; then
+          echo "Generating kubeconfig for existing cluster..."
+          aws eks update-kubeconfig --region us-east-1 --name "$CLUSTER_NAME" --kubeconfig /tmp/kubeconfig
+          echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+        else
+          echo "No existing cluster found, skipping kubeconfig generation"
+        fi
+
+    - name: Plan Terraform (Infrastructure Only)
       run: |
         terraform plan -compact-warnings \
           -var-file=terraform.tfvars \
-          -var 'deploy_k8s=false' \
+          -var 'deploy_k8s=true' \
           -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
-          -out=tfplan || true
+          -target=module.network \
+          -target=module.backend.aws_eks_cluster.main \
+          -target=module.backend.aws_eks_node_group.main \
+          -target=module.backend.aws_security_group.node_group_sg \
+          -out=tfplan
 
-    - name: Apply Terraform (Complete Infrastructure)
+    - name: Apply Terraform (Infrastructure Only)
       run: terraform apply -auto-approve tfplan
 
     - name: Wait for EKS to be ACTIVE
@@ -84,41 +99,6 @@ jobs:
           sleep 15
         done
         echo "Cluster not ACTIVE in time" && exit 1
-
-    - name: Generate kubeconfig for aws-auth
-      run: |
-        CLUSTER_NAME=$(terraform output -raw cluster_name)
-        aws eks update-kubeconfig --region us-east-1 --name "$CLUSTER_NAME" --kubeconfig /tmp/kubeconfig
-        echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
-
-    - name: Apply aws-auth ConfigMap via Terraform
-      run: |
-        # Check if aws-auth already exists in Terraform state
-        if terraform state show module.backend.kubernetes_config_map_v1.aws_auth[0] 2>/dev/null; then
-          echo "✅ aws-auth already in Terraform state, skipping creation"
-        else
-          # Check if aws-auth exists in cluster
-          if kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system 2>/dev/null; then
-            echo "⚠️ aws-auth exists in cluster but not in Terraform state. Importing..."
-            terraform import \
-              -var-file=terraform.tfvars \
-              -var 'deploy_k8s=false' \
-              -var 'create_pipeline_access=true' \
-              -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
-              'module.backend.kubernetes_config_map_v1.aws_auth[0]' \
-              'kube-system/aws-auth'
-          else
-            # Create aws-auth if it doesn't exist
-            terraform apply -auto-approve \
-              -var-file=terraform.tfvars \
-              -var 'deploy_k8s=false' \
-              -var 'create_pipeline_access=true' \
-              -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
-              -target=module.backend.kubernetes_config_map_v1.aws_auth
-          fi
-        fi
-        echo "✅ aws-auth ConfigMap ready"
-        sleep 10
 
     - name: Export Terraform Outputs
       run: |

@@ -72,6 +72,11 @@ output "rancher_namespace" {
   value       = module.backend.rancher_namespace
 }
 
+output "node_role_arn" {
+  description = "ARN of the EKS node group IAM role"
+  value       = module.backend.node_role_arn
+}
+
 # Connection Instructions
 output "kubectl_config_command" {
   description = "Command to configure kubectl"

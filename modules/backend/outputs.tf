@@ -105,3 +105,8 @@ output "cluster_certificate_authority" {
   description = "EKS cluster certificate authority data (base64)"
   value       = aws_eks_cluster.main.certificate_authority[0].data
 }
+
+output "node_role_arn" {
+  description = "ARN of the EKS node group IAM role"
+  value       = aws_iam_role.nodes.arn
+}

@@ -10,13 +10,13 @@ vpc_cidr        = "10.0.0.0/16"
 public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
 private_subnets = ["10.0.10.0/24", "10.0.20.0/24"]
 
-# Node Groups Configuration - FREE TIER ELIGIBLE
+# Node Groups Configuration
 node_groups = {
   general = {
     name           = "general"
     instance_types = ["m7i-flex.large"]
     desired_size   = 2
-    min_size       = 1
+    min_size       = 2
     max_size       = 3
     disk_size      = 20
   }

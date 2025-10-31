@@ -101,43 +101,65 @@ jobs:
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME --kubeconfig /tmp/kubeconfig
           export KUBECONFIG=/tmp/kubeconfig
           
+          # Verify connection
+          kubectl cluster-info || echo "Cannot connect to cluster"
+          
+          # Delete Ingress first (to cleanup ALB)
+          echo "Removing Ingress resources..."
+          kubectl delete ingress --all -n cattle-system --timeout=60s || echo "Ingress already removed"
+          
           # Delete Rancher Helm release
           echo "Removing Rancher Helm release..."
-          helm uninstall rancher -n cattle-system --timeout=300s || echo "Rancher already removed"
+          helm uninstall rancher -n cattle-system --timeout=120s || echo "Rancher already removed"
           
           # Delete AWS Load Balancer Controller
           echo "Removing AWS Load Balancer Controller..."
-          helm uninstall aws-load-balancer-controller -n kube-system --timeout=300s || echo "ALB Controller already removed"
+          helm uninstall aws-load-balancer-controller -n kube-system --timeout=120s || echo "ALB Controller already removed"
           
-          # Delete cert-manager
-          echo "Removing cert-manager..."
-          helm uninstall cert-manager -n cert-manager --timeout=300s || echo "cert-manager already removed"
+          # Delete namespaces
+          echo "Removing namespaces..."
+          kubectl delete namespace cattle-system --timeout=60s || echo "cattle-system already removed"
           
           # Wait for resources to clean up
           echo "Waiting for resources to clean up..."
-          sleep 60
+          sleep 30
           
           # Show remaining resources
-          echo "Remaining pods:"
-          kubectl get pods --all-namespaces || echo "Cannot get pods"
-          
-          echo "Remaining load balancers:"
+          echo "Remaining LoadBalancer services:"
           kubectl get svc --all-namespaces -o wide | grep LoadBalancer || echo "No LoadBalancer services found"
           
         else
-          echo "Cluster $CLUSTER_NAME not found or not accessible"
-          echo "Creating empty kubeconfig to avoid provider errors..."
-          mkdir -p /tmp
-          echo "apiVersion: v1" > /tmp/kubeconfig
-          echo "kind: Config" >> /tmp/kubeconfig
-          echo "clusters: []" >> /tmp/kubeconfig
-          echo "contexts: []" >> /tmp/kubeconfig
-          echo "users: []" >> /tmp/kubeconfig
+          echo "Cluster $CLUSTER_NAME not found or not accessible - skipping k8s cleanup"
         fi
+        
+        # Always create a dummy kubeconfig for Terraform provider
+        echo "Creating kubeconfig for Terraform provider..."
+        mkdir -p /tmp
+        echo 'apiVersion: v1' > /tmp/kubeconfig
+        echo 'kind: Config' >> /tmp/kubeconfig
+        echo 'clusters: []' >> /tmp/kubeconfig
+        echo 'contexts: []' >> /tmp/kubeconfig
+        echo 'users: []' >> /tmp/kubeconfig
+        echo 'current-context: ""' >> /tmp/kubeconfig
+        echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
 
     - name: Destroy Infrastructure
       run: |
         echo "🔥 Starting infrastructure destruction..."
+        
+        # Set KUBECONFIG for this step
+        export KUBECONFIG=/tmp/kubeconfig
+        
+        # Remove Kubernetes resources from state before destroying (cluster is not accessible from CI)
+        echo "Removing Kubernetes resources from Terraform state..."
+        terraform state rm 'module.backend.kubernetes_namespace.cattle_system[0]' 2>/dev/null || echo "Already removed"
+        terraform state rm 'module.backend.kubernetes_config_map_v1.aws_auth[0]' 2>/dev/null || echo "Already removed"
+        terraform state rm 'module.backend.kubernetes_ingress_v1.rancher_ingress[0]' 2>/dev/null || echo "Already removed"
+        terraform state rm 'module.backend.helm_release.aws_load_balancer_controller[0]' 2>/dev/null || echo "Already removed"
+        terraform state rm 'module.backend.helm_release.rancher[0]' 2>/dev/null || echo "Already removed"
+        
+        echo "Remaining resources in state:"
+        terraform state list
         
         if [ "${{ github.event.inputs.force_destroy }}" = "true" ]; then
           echo "⚠️ Force destroy enabled - ignoring errors"

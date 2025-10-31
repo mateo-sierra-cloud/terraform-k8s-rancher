@@ -78,13 +78,15 @@ jobs:
         CLUSTER_NAME=$(terraform output -raw cluster_name)
         PRINCIPAL_ARN=${{ secrets.ROLE_ARN }}
         echo "Checking Access Entry for $PRINCIPAL_ARN on $CLUSTER_NAME"
-        aws eks describe-access-entry --cluster-name "$CLUSTER_NAME" --principal-arn "$PRINCIPAL_ARN" || {
-          echo "❌ Access Entry not found. Re-running deploy-infra workflow is required."
-          exit 1
-        }
-        echo "✅ Access Entry found"
-        echo "Associated policies:"
-        aws eks list-associated-access-policies --cluster-name "$CLUSTER_NAME" --principal-arn "$PRINCIPAL_ARN"
+        
+        if aws eks describe-access-entry --cluster-name "$CLUSTER_NAME" --principal-arn "$PRINCIPAL_ARN" 2>/dev/null; then
+          echo "⚠️ Access Entry found but has issues with {{SessionName}} placeholder"
+          echo "Deleting Access Entry to force aws-auth ConfigMap usage..."
+          aws eks delete-access-entry --cluster-name "$CLUSTER_NAME" --principal-arn "$PRINCIPAL_ARN"
+          echo "✅ Access Entry deleted. Cluster will now use aws-auth ConfigMap"
+        else
+          echo "✅ No Access Entry found. Cluster will use aws-auth ConfigMap"
+        fi
 
     - name: Verify cluster authentication mode
       run: |
@@ -119,25 +121,68 @@ jobs:
           echo "✅ Cluster already in API_AND_CONFIG_MAP mode"
         fi
 
-    - name: Patch aws-auth ConfigMap (fallback for API mode)
+    - name: Verify aws-auth ConfigMap
       run: |
+        echo "Getting current AWS identity..."
+        CURRENT_IDENTITY=$(aws sts get-caller-identity --query 'Arn' --output text)
+        echo "Current identity ARN: $CURRENT_IDENTITY"
+        
+        CLUSTER_NAME=$(terraform output -raw cluster_name)
+        PIPELINE_ROLE="${{ secrets.ROLE_ARN }}"
+        
         echo "Checking if aws-auth ConfigMap exists..."
-        if ! kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system 2>/dev/null; then
-          echo "❌ aws-auth ConfigMap not found. Run deploy-infra first."
-          exit 1
+        if kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system 2>/dev/null; then
+          echo "✅ aws-auth exists in cluster"
+        else
+          echo "⚠️ aws-auth does not exist - Creating Access Entry for pipeline role instead..."
+          
+          # Create Access Entry for pipeline role using AWS API (doesn't require k8s permissions)
+          if ! aws eks describe-access-entry --cluster-name "$CLUSTER_NAME" --principal-arn "$PIPELINE_ROLE" 2>/dev/null; then
+            echo "Creating Access Entry for $PIPELINE_ROLE..."
+            aws eks create-access-entry \
+              --cluster-name "$CLUSTER_NAME" \
+              --principal-arn "$PIPELINE_ROLE" \
+              --type STANDARD \
+              --username github-actions
+            
+            echo "Associating cluster-admin policy..."
+            aws eks associate-access-policy \
+              --cluster-name "$CLUSTER_NAME" \
+              --principal-arn "$PIPELINE_ROLE" \
+              --access-scope type=cluster \
+              --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+            
+            echo "✅ Access Entry created successfully"
+            sleep 10
+          else
+            echo "✅ Access Entry already exists"
+          fi
         fi
         
-        echo "Verifying pipeline role is in aws-auth..."
-        kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system -o yaml | tee /tmp/aws-auth-current.yaml
-        
-        if ! grep -q "${{ secrets.ROLE_ARN }}" /tmp/aws-auth-current.yaml; then
-          echo "❌ Pipeline role not found in aws-auth. This should have been created by deploy-infra."
-          echo "Please re-run deploy-infra workflow."
-          exit 1
+        echo ""
+        echo "Regenerating kubeconfig..."
+        rm -f /tmp/kubeconfig
+        aws eks update-kubeconfig --region us-east-1 --name "$CLUSTER_NAME" --kubeconfig /tmp/kubeconfig
+        echo "✅ kubeconfig regenerated"
+
+    - name: Create or import aws-auth ConfigMap
+      run: |
+        # Try to import if it already exists
+        if kubectl --kubeconfig /tmp/kubeconfig get cm aws-auth -n kube-system 2>/dev/null; then
+          echo "aws-auth exists, importing to Terraform state..."
+          terraform import \
+            -var-file=terraform.tfvars \
+            -var 'deploy_k8s=true' \
+            -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+            'module.backend.kubernetes_config_map_v1.aws_auth[0]' kube-system/aws-auth || echo "Already in state"
         fi
         
-        echo "✅ Pipeline role found in aws-auth ConfigMap"
-        sleep 5
+        # Now apply to ensure it matches desired state
+        terraform apply -auto-approve \
+          -var-file=terraform.tfvars \
+          -var 'deploy_k8s=true' \
+          -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
+          -target=module.backend.kubernetes_config_map_v1.aws_auth
 
     - name: Validate RBAC permissions
       run: |
@@ -152,20 +197,40 @@ jobs:
           sleep 5
         done
 
+    - name: Force Rancher recreation if service is missing
+      run: |
+        if ! kubectl --kubeconfig /tmp/kubeconfig get svc rancher -n cattle-system 2>/dev/null; then
+          echo "⚠️ Rancher service not found, forcing complete recreation..."
+          
+          echo "Removing Rancher from Terraform state..."
+          terraform state rm 'module.backend.helm_release.rancher[0]' || echo "Not in state"
+          
+          echo "Uninstalling Rancher helm release from cluster..."
+          helm uninstall rancher -n cattle-system --kubeconfig /tmp/kubeconfig || echo "Helm release not found"
+          
+          echo "Waiting for pods to terminate..."
+          sleep 10
+        fi
+
     - name: Plan Terraform (K8s/Helm)
       run: |
         terraform plan -refresh=false -compact-warnings \
           -var-file=terraform.tfvars \
           -var 'deploy_k8s=true' \
           -var 'pipeline_deployer_role_arn=${{ secrets.ROLE_ARN }}' \
-          -target=module.backend.kubernetes_namespace.cattle_system \
-          -target=module.backend.helm_release.aws_load_balancer_controller \
-          -target=module.backend.helm_release.rancher \
-          -target=module.backend.kubernetes_ingress_v1.rancher_ingress \
           -out=tfplan_k8s || true
 
     - name: Apply Terraform (K8s/Helm)
       run: terraform apply -auto-approve tfplan_k8s
+
+    - name: Restart Rancher if ClusterRoleBinding was created
+      run: |
+        if kubectl --kubeconfig /tmp/kubeconfig get clusterrolebinding rancher-admin 2>/dev/null; then
+          echo "ClusterRoleBinding exists, restarting Rancher to apply new permissions..."
+          kubectl --kubeconfig /tmp/kubeconfig rollout restart deployment rancher -n cattle-system
+          echo "Waiting for rollout to complete..."
+          kubectl --kubeconfig /tmp/kubeconfig rollout status deployment rancher -n cattle-system --timeout=5m
+        fi
 
     - name: Wait for Rancher to be Ready
       run: |
@@ -173,11 +238,31 @@ jobs:
         for i in {1..30}; do
           READY=$(kubectl --kubeconfig /tmp/kubeconfig get deploy rancher -n cattle-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
           echo "Attempt $i - Ready replicas: $READY"
-          if [ "$READY" -gt 0 ]; then
+          if [ "$READY" -gt 0 ] 2>/dev/null; then
             echo "✅ Rancher is ready"; break
           fi
           sleep 10
         done
+        
+        echo ""
+        echo "Checking Rancher pod status..."
+        kubectl --kubeconfig /tmp/kubeconfig get pods -n cattle-system
+        
+        echo ""
+        echo "Checking Rancher logs for errors..."
+        kubectl --kubeconfig /tmp/kubeconfig logs -n cattle-system deployment/rancher --tail=100 || echo "Could not get logs"
+
+    - name: Get Node IP for NodePort access
+      run: |
+        echo "Getting node public IP for NodePort access..."
+        NODE_IP=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || echo "")
+        if [ -z "$NODE_IP" ]; then
+          echo "⚠️ No external IP found. Nodes might be in private subnets."
+          echo "Getting internal IP instead..."
+          NODE_IP=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        fi
+        echo "Node IP: $NODE_IP"
+        echo "NODE_IP=$NODE_IP" >> $GITHUB_ENV
 
     - name: Export Terraform Outputs
       run: |
@@ -192,8 +277,10 @@ jobs:
         echo "Rancher Namespace: $(terraform output -raw rancher_namespace)"
         echo "Rancher Hostname: $(terraform output -raw rancher_hostname)"
         echo ""
-        echo "🌐 Access Rancher via Load Balancer:"
-        LB_DNS=$(kubectl --kubeconfig /tmp/kubeconfig get ingress rancher-alb -n cattle-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
-        echo "Load Balancer DNS: $LB_DNS"
+        echo "🌐 Access Rancher via NodePort:"
+        echo "Node IP: $NODE_IP"
+        echo "Rancher URL: http://$NODE_IP:30080"
         echo ""
-        echo "Default password: admin"
+        echo "Default credentials:"
+        echo "  Username: admin"
+        echo "  Password: admin"
